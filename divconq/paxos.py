@@ -6,8 +6,9 @@ A successful basic paxos run:
 1) promise ------->X             |
 2)   X<------- promised          |
 3) accept -------->X             |
-4)   X<------- accepted          |
-5)   |           learn --------->X
+4)   |           learn --------->X
+5)   |             X <------ learned
+6)   X<------- accepted          |
 
 promise/promised and accept/accepted are each combined as RPC request/response
 pairs with the proposer acting as client and the acceptors as servers.
@@ -15,21 +16,82 @@ pairs with the proposer acting as client and the acceptors as servers.
 Since the promise and accept messages need only be successfully acknowledged by
 a quorum of acceptors, the proposer waits for each individual response arrival,
 rather than for the RPC completion as a whole. When it has enough, it moves the
-process forward. The 'learn' message (and also its 'unlearn' failure-case
-counterpart) is a publish message.
+process forward.
 
 The learners must store in memory the data in every 'learn' message, but they
 move it from a status of in-process to committed once they have received
 affirmative messages from a quorum for a single proposition.
 """
 
+import time
+
 import junction
 import junction.errors
 
 
-class QuorumUnavailable(junction.errors.HandledError):
-    'fewer than (<cluster-size> // 2) + 1 acceptors are online'
-    code = 0xa0a2edb42587c36 # hex(hash("QuorumUnavailable"))
+class Proposer(object):
+    def __init__(self, group_id, cluster_size, hub):
+        self._started = False
+        self._hub = hub
+        self._groupid = group_id
+        self._clustersize = cluster_size
+        self._acceptor_count = None
+        self._numbers = {}
+
+    def start(self):
+        if self._started: return
+        self._started = True
+
+        # offer up this functionality on the junction network
+        self._hub.accept_rpc(
+                'divconq.paxos.propose',
+                (1 << 64) - 1,
+                self._groupid,
+                'propose',
+                self.propose,
+                schedule=True)
+
+    def propose(self, key, value, timeout=30.0):
+        if timeout is not None:
+            stoptime = time.time() + timeout
+
+        if key in self._numbers:
+            self._numbers[key] += 1
+        else:
+            self._numbers[key] = 1
+        num = self._numbers[key]
+
+        promise = self._hub.send_rpc(
+                'divconq.paxos.accept',
+                self._groupid,
+                'promise',
+                (key, num),
+                {})
+
+        success, results = await_quorum(
+                promise, lambda x: x[0]['success'], self._clustersize,
+                timeout and (stoptime - time.time()))
+        results = [r[0] for r in results]
+
+        if not success:
+            results = [r['promised'] for r in results if not r['success']]
+            self._numbers[key] = max(results)
+            return False
+
+        results = [r['value'] for r in results if r['success'] and r['value']]
+        if results:
+            results.sort(reverse=True)
+            value = results[0][1]
+
+        proposal = self._hub.send_rpc(
+                'divconq.paxos.accept',
+                self._groupid,
+                'accept',
+                (key, num, value),
+                {})
+
+        return await_quorum(proposal, None, self._clustersize,
+                timeout and stoptime - time.time())[0]
 
 
 class Acceptor(object):
@@ -58,7 +120,7 @@ class Acceptor(object):
                 self._groupid,
                 'accept',
                 self._handle_accept,
-                schedule=False)
+                schedule=True)
 
     def _handle_promise(self, key, num):
         if self._promised.get(key, 0) >= num:
@@ -84,103 +146,13 @@ class Acceptor(object):
             return False
 
         self._values[key] = (num, value)
-        self._hub.publish(
+        self._hub.rpc(
                 'divconq.paxos.learn',
                 self._groupid,
                 'learn',
                 (key, num, value),
                 {})
         return True
-
-
-class Proposer(object):
-    def __init__(self, group_id, cluster_size, hub):
-        self._started = False
-        self._hub = hub
-        self._groupid = group_id
-        self._clustersize = cluster_size
-        self._acceptor_count = None
-        self._numbers = {}
-
-    def start(self):
-        if self._started: return
-        self._started = True
-
-        # offer up this functionality on the junction network
-        self._hub.accept_rpc(
-                'divconq.paxos.propose',
-                (1 << 64) - 1,
-                self._groupid,
-                'propose',
-                self.propose,
-                schedule=True)
-
-    def propose(self, key, value):
-        if key in self._numbers:
-            self._numbers[key] += 1
-        else:
-            self._numbers[key] = 1
-        num = self._numbers[key]
-
-        promise = self._hub.send_rpc(
-                'divconq.paxos.accept',
-                self._groupid,
-                'promise',
-                (key, num),
-                {})
-
-        quorum = (self._clustersize // 2) + 1
-        if promise.target_count < quorum:
-            raise QuorumUnavailable(
-                    "%d out of %d acceptors receiving promise request" %
-                    (promise.target_count, self._clustersize))
-
-        while 1:
-            # wait for a quorum response to the promise request
-            promise.arrival.wait()
-            partial = promise.partial_results
-            partial = [p[0] for p in partial]
-
-            candidates = [r['value'] for r in partial if r['success']]
-            if len(candidates) >= quorum:
-                break
-
-            failures = [r['promised'] for r in partial if not r['success']]
-            if len(failures) >= quorum:
-                # rejections from a quorum, failure
-                self._numbers[key] = max(failures)
-                return False
-
-        candidates = filter(None, candidates)
-        candidates.sort(reverse=True)
-        if candidates:
-            value = candidates[0][1]
-
-        proposal = self._hub.send_rpc(
-                'divconq.paxos.accept',
-                self._groupid,
-                'accept',
-                (key, num, value),
-                {})
-
-        if proposal.target_count < quorum:
-            raise QuorumUnavailable(
-                    "%d out of %d acceptors receiving proposal request" %
-                    (promise.target_count, self._clustersize))
-
-        while 1:
-            # wait for a quorum response to the accept request
-            proposal.arrival.wait()
-            partial = promise.partial_results
-            passed = len(filter(None, partial))
-
-            if passed >= quorum:
-                # got a quorum of accepts
-                return True
-
-            if len(partial) - passed >= quorum:
-                # got a quorum of rejects
-                return False
 
 
 class Learner(object):
@@ -198,7 +170,7 @@ class Learner(object):
 
         #TODO: get up-to-speed from any peers
 
-        self._hub.accept_publish(
+        self._hub.accept_rpc(
                 'divconq.paxos.learn',
                 (1 << 64) - 1,
                 self._groupid,
@@ -230,6 +202,8 @@ class Learner(object):
             # a quorum of successes
             self._learned[key] = value
             del self._learning[key]
+
+        return True
 
     def _handle_unlearn(self, key, num):
         prev_num, good, bad = self._learning.get(key, (0, 0, 0))
@@ -285,3 +259,34 @@ class Server(object):
             self._acceptor.start()
         if self._learner:
             self._learner.start()
+
+
+class QuorumUnavailable(junction.errors.HandledError):
+    'fewer than (<cluster-size> // 2) + 1 acceptors are online'
+    code = -0x6e9ec5a6d2a90fff # hex(hash("divconq.paxos.QuorumUnavailable"))
+
+class OperationTimedOut(junction.errors.HandledError):
+    code = 0x46758d2a059baa16 # hex(hash("divconq.paxos.OperationTimedOut"))
+
+
+def await_quorum(rpc, passfail, cluster_size, timeout=None):
+    quorum = (cluster_size // 2) + 1
+    if timeout is not None:
+        timeout += time.time()
+    kwarg = {}
+
+    if rpc.target_count < quorum:
+        raise QuorumUnavailable()
+
+    while 1:
+        results = rpc.partial_results
+        goodbad = map(passfail, results) if passfail else results
+        if goodbad.count(True) > quorum:
+            return True, results
+        if rpc.complete or goodbad.count(False) > quorum:
+            return False, results
+
+        if timeout is not None:
+            kwarg['timeout'] = timeout - time.time()
+        if rpc.arrival.wait(**kwarg):
+            raise OperationTimedOut()
