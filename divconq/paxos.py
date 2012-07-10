@@ -51,7 +51,7 @@ class Proposer(object):
                 self.propose,
                 schedule=True)
 
-    def propose(self, key, value, timeout=30.0):
+    def propose(self, key, value, overwrite=False, timeout=30.0):
         if timeout is not None:
             stoptime = time.time() + timeout
 
@@ -78,10 +78,12 @@ class Proposer(object):
             self._numbers[key] = max(results)
             return False
 
-        results = [r['value'] for r in results if r['success'] and r['value']]
-        if results:
-            results.sort(reverse=True)
-            value = results[0][1]
+        if not overwrite:
+            results = [r['value'] for r in results
+                    if r['success'] and r['value']]
+            if results:
+                results.sort(reverse=True)
+                value = results[0][1]
 
         proposal = self._hub.send_rpc(
                 'divconq.paxos.accept',
